@@ -19,11 +19,15 @@ interface ParsedArgs {
   maxTurns?: number;
 }
 
+const DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-pro";
+const DEEPSEEK_OPENAI_BASE_URL = "https://api.deepseek.com";
+
 function parseArgs(): ParsedArgs {
   const args = process.argv.slice(2);
   let permissionMode: PermissionMode = "default";
   let thinking = false;
-  let model = process.env.MINI_CLAUDE_MODEL || "claude-opus-4-6";
+  let model = process.env.MINI_CLAUDE_MODEL
+    || (process.env.DEEPSEEK_API_KEY_MINICC ? DEEPSEEK_DEFAULT_MODEL : "claude-opus-4-6");
   let apiBase: string | undefined;
   let resume = false;
   let maxCost: number | undefined;
@@ -63,7 +67,8 @@ Options:
   --accept-edits      Auto-approve file edits, still confirm dangerous shell
   --dont-ask          Auto-deny anything needing confirmation (for CI)
   --thinking          Enable extended thinking (Anthropic only)
-  --model, -m         Model to use (default: claude-opus-4-6, or MINI_CLAUDE_MODEL env)
+  --model, -m         Model to use (default: deepseek-v4-pro when DEEPSEEK_API_KEY_MINICC is set,
+                      otherwise claude-opus-4-6; MINI_CLAUDE_MODEL overrides either)
   --api-base URL      Use OpenAI-compatible API endpoint (key via env var)
   --resume            Resume the last session
   --max-cost USD      Stop when estimated cost exceeds this amount
@@ -85,6 +90,7 @@ Examples:
   mini-claude --plan "how would you refactor this?"
   mini-claude --accept-edits "add error handling to api.ts"
   mini-claude --max-cost 0.50 --max-turns 20 "implement feature X"
+  DEEPSEEK_API_KEY_MINICC=sk-xxx mini-claude "hello"
   OPENAI_API_KEY=sk-xxx mini-claude --api-base https://aihubmix.com/v1 --model gpt-4o "hello"
   mini-claude --resume
   mini-claude  # starts interactive REPL
@@ -299,8 +305,14 @@ async function main() {
   let resolvedApiKey: string | undefined;
   let resolvedUseOpenAI = !!apiBase;
 
-  // Check OPENAI env vars first (if OPENAI_BASE_URL is set, use OpenAI format)
-  if (process.env.OPENAI_API_KEY && process.env.OPENAI_BASE_URL) {
+  // Project-local DeepSeek shortcut. DeepSeek is used through its
+  // OpenAI-compatible endpoint because that path is designed for third-party
+  // compatible chat-completions APIs and avoids Anthropic-only thinking logic.
+  if (process.env.DEEPSEEK_API_KEY_MINICC) {
+    resolvedApiKey = process.env.DEEPSEEK_API_KEY_MINICC;
+    resolvedApiBase = resolvedApiBase || DEEPSEEK_OPENAI_BASE_URL;
+    resolvedUseOpenAI = true;
+  } else if (process.env.OPENAI_API_KEY && process.env.OPENAI_BASE_URL) {
     resolvedApiKey = process.env.OPENAI_API_KEY;
     resolvedApiBase = resolvedApiBase || process.env.OPENAI_BASE_URL;
     resolvedUseOpenAI = true;
@@ -316,13 +328,14 @@ async function main() {
 
   // --api-base without env key: check if any key is available
   if (!resolvedApiKey && apiBase) {
-    resolvedApiKey = process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY;
+    resolvedApiKey = process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY_MINICC || process.env.ANTHROPIC_API_KEY;
     resolvedUseOpenAI = true;
   }
 
   if (!resolvedApiKey) {
     printError(
       `API key is required.\n` +
+        `  Set DEEPSEEK_API_KEY_MINICC for DeepSeek OpenAI-compatible format,\n` +
         `  Set ANTHROPIC_API_KEY (+ optional ANTHROPIC_BASE_URL) for Anthropic format,\n` +
         `  or OPENAI_API_KEY + OPENAI_BASE_URL for OpenAI-compatible format.`
     );
