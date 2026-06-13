@@ -25,6 +25,8 @@ import {
   type MemoryPrefetch, type RelevantMemory, type SideQueryFn,
 } from "./memory.js";
 import { McpManager } from "./mcp.js";
+import { HookRunner, buildHookPayload } from "./hooks.js";
+import { TraceRecorder, summarizeResult, summarizeText, summarizeToolInput } from "./trace.js";
 import * as readline from "readline";
 import { randomUUID } from "crypto";
 import { existsSync, readFileSync, mkdirSync, writeFileSync } from "fs";
@@ -136,6 +138,7 @@ interface AgentOptions {
   maxCostUsd?: number;        // Budget: max USD spend
   maxTurns?: number;          // Budget: max agentic turns
   confirmFn?: (message: string) => Promise<boolean>; // External confirmation callback
+  trace?: TraceRecorder;
   // Sub-agent options
   customSystemPrompt?: string;
   customTools?: ToolDef[];
@@ -159,6 +162,8 @@ export class Agent {
   private sessionId: string;
   private sessionStartTime: string;
   private isSubAgent: boolean;
+  private trace?: TraceRecorder;
+  private hookRunner: HookRunner;
 
   // MCP integration
   private mcpManager = new McpManager();
@@ -220,6 +225,8 @@ export class Agent {
     this.maxCostUsd = options.maxCostUsd;
     this.maxTurns = options.maxTurns;
     this.confirmFn = options.confirmFn;
+    this.trace = options.trace;
+    this.hookRunner = new HookRunner();
     this.effectiveWindow = getContextWindow(this.model) - 20000;
     this.sessionId = randomUUID().slice(0, 8);
     this.sessionStartTime = new Date().toISOString();
@@ -341,6 +348,15 @@ export class Agent {
   }
 
   async chat(userMessage: string): Promise<void> {
+    const started = Date.now();
+    this.trace?.record("run_start", {
+      sessionId: this.sessionId,
+      model: this.model,
+      backend: this.useOpenAI ? "openai-compatible" : "anthropic",
+      permissionMode: this.permissionMode,
+      isSubAgent: this.isSubAgent,
+      prompt: summarizeText(userMessage),
+    });
     // Lazily connect to MCP servers on first chat (main agent only)
     if (!this.mcpInitialized && !this.isSubAgent) {
       this.mcpInitialized = true;
@@ -351,6 +367,7 @@ export class Agent {
           this.tools = [...this.tools, ...mcpDefs as ToolDef[]];
         }
       } catch (err: any) {
+        this.trace?.error("mcp_init", err);
         console.error(`[mcp] Init failed: ${err.message}`);
       }
     }
@@ -361,6 +378,28 @@ export class Agent {
       } else {
         await this.chatAnthropic(userMessage);
       }
+      this.trace?.record("run_end", {
+        status: "ok",
+        durationMs: Date.now() - started,
+        inputTokens: this.totalInputTokens,
+        outputTokens: this.totalOutputTokens,
+        estimatedCostUsd: this.getCurrentCostUsd(),
+      });
+      this.trace?.record("cost_update", {
+        inputTokens: this.totalInputTokens,
+        outputTokens: this.totalOutputTokens,
+        estimatedCostUsd: this.getCurrentCostUsd(),
+      });
+    } catch (err) {
+      this.trace?.error("run", err);
+      this.trace?.record("run_end", {
+        status: "error",
+        durationMs: Date.now() - started,
+        inputTokens: this.totalInputTokens,
+        outputTokens: this.totalOutputTokens,
+        estimatedCostUsd: this.getCurrentCostUsd(),
+      });
+      throw err;
     } finally {
       this.abortController = null;
     }
@@ -763,7 +802,22 @@ export class Agent {
     return `[Result too large (${sizeKB} KB, ${lines.length} lines). Full output saved to ${filepath}. You can use read_file to see the full result.]\n\nPreview (first 200 lines):\n${preview}`;
   }
 
-  private async executeToolCall(
+  private checkToolPermission(
+    name: string,
+    input: Record<string, any>
+  ): { action: "allow" | "deny" | "confirm"; message?: string } {
+    const result = checkPermission(name, input, this.permissionMode, this.planFilePath || undefined);
+    this.trace?.record("permission_check", {
+      tool: name,
+      input: summarizeToolInput(name, input),
+      mode: this.permissionMode,
+      action: result.action,
+      message: result.message,
+    });
+    return result;
+  }
+
+  private async executeToolImplementation(
     name: string,
     input: Record<string, any>
   ): Promise<string> {
@@ -773,6 +827,65 @@ export class Agent {
     // Route MCP tool calls to the MCP manager
     if (this.mcpManager.isMcpTool(name)) return this.mcpManager.callTool(name, input);
     return executeTool(name, input, this.readFileState);
+  }
+
+  private async executeToolCall(
+    name: string,
+    input: Record<string, any>,
+    permission?: { action: "allow" | "deny" | "confirm"; message?: string }
+  ): Promise<string> {
+    const started = Date.now();
+    this.trace?.record("tool_call_start", {
+      tool: name,
+      input: summarizeToolInput(name, input),
+      permission,
+    });
+
+    const preDecision = await this.hookRunner.runPreToolUse(
+      buildHookPayload("PreToolUse", name, input, {
+        runId: this.trace?.runId,
+        permission,
+      }),
+      this.trace
+    );
+    if (preDecision.action === "deny") {
+      const denied = `Action denied by hook: ${preDecision.reason || "blocked"}`;
+      this.trace?.record("tool_call_end", {
+        tool: name,
+        status: "denied",
+        deniedBy: "hook",
+        durationMs: Date.now() - started,
+        result: summarizeResult(denied),
+      });
+      return denied;
+    }
+
+    try {
+      const result = await this.executeToolImplementation(name, input);
+      await this.hookRunner.runPostToolUse(
+        buildHookPayload("PostToolUse", name, input, {
+          runId: this.trace?.runId,
+          permission,
+          result,
+        }),
+        this.trace
+      );
+      this.trace?.record("tool_call_end", {
+        tool: name,
+        status: result.startsWith("Error") ? "error" : "ok",
+        durationMs: Date.now() - started,
+        result: summarizeResult(result),
+      });
+      return result;
+    } catch (err) {
+      this.trace?.error("tool_call", err, { tool: name, input: summarizeToolInput(name, input) });
+      this.trace?.record("tool_call_end", {
+        tool: name,
+        status: "error",
+        durationMs: Date.now() - started,
+      });
+      throw err;
+    }
   }
 
   // ─── Skill fork mode ─────────────────────────────────────
@@ -788,7 +901,14 @@ export class Agent {
         ? this.tools.filter(t => result.allowedTools!.includes(t.name))
         : this.tools.filter(t => t.name !== "agent");
 
+      const subStarted = Date.now();
       printSubAgentStart("skill-fork", input.skill_name);
+      this.trace?.record("subagent_start", {
+        kind: "skill",
+        type: "skill-fork",
+        name: input.skill_name,
+        prompt: summarizeText(input.args || ""),
+      });
       const subAgent = new Agent({
         model: this.model,
         apiBase: this.useOpenAI ? this.openaiClient?.baseURL : undefined,
@@ -796,6 +916,7 @@ export class Agent {
         customTools: tools,
         isSubAgent: true,
         permissionMode: this.permissionMode === "plan" ? "plan" : "bypassPermissions",
+        trace: this.trace,
       });
 
       try {
@@ -803,9 +924,27 @@ export class Agent {
         this.totalInputTokens += subResult.tokens.input;
         this.totalOutputTokens += subResult.tokens.output;
         printSubAgentEnd("skill-fork", input.skill_name);
+        this.trace?.record("subagent_end", {
+          kind: "skill",
+          type: "skill-fork",
+          name: input.skill_name,
+          status: "ok",
+          durationMs: Date.now() - subStarted,
+          inputTokens: subResult.tokens.input,
+          outputTokens: subResult.tokens.output,
+          output: summarizeText(subResult.text || ""),
+        });
         return subResult.text || "(Skill produced no output)";
       } catch (e: any) {
         printSubAgentEnd("skill-fork", input.skill_name);
+        this.trace?.record("subagent_end", {
+          kind: "skill",
+          type: "skill-fork",
+          name: input.skill_name,
+          status: "error",
+          durationMs: Date.now() - subStarted,
+          error: e.message,
+        });
         return `Skill fork error: ${e.message}`;
       }
     }
@@ -943,7 +1082,14 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     const description = input.description || "sub-agent task";
     const prompt = input.prompt || "";
 
+    const subStarted = Date.now();
     printSubAgentStart(type, description);
+    this.trace?.record("subagent_start", {
+      kind: "agent",
+      type,
+      description,
+      prompt: summarizeText(prompt),
+    });
 
     const config = getSubAgentConfig(type);
     const subAgent = new Agent({
@@ -956,6 +1102,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
       customTools: config.tools,
       isSubAgent: true,
       permissionMode: this.permissionMode === "plan" ? "plan" : "bypassPermissions",
+      trace: this.trace,
     });
 
     try {
@@ -964,9 +1111,27 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
       this.totalInputTokens += result.tokens.input;
       this.totalOutputTokens += result.tokens.output;
       printSubAgentEnd(type, description);
+      this.trace?.record("subagent_end", {
+        kind: "agent",
+        type,
+        description,
+        status: "ok",
+        durationMs: Date.now() - subStarted,
+        inputTokens: result.tokens.input,
+        outputTokens: result.tokens.output,
+        output: summarizeText(result.text || ""),
+      });
       return result.text || "(Sub-agent produced no output)";
     } catch (e: any) {
       printSubAgentEnd(type, description);
+      this.trace?.record("subagent_end", {
+        kind: "agent",
+        type,
+        description,
+        status: "error",
+        durationMs: Date.now() - subStarted,
+        error: e.message,
+      });
       return `Sub-agent error: ${e.message}`;
     }
   }
@@ -990,6 +1155,12 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
           this.alreadySurfacedMemories, this.sessionMemoryBytes,
           this.abortController?.signal,
         );
+        if (memoryPrefetch) {
+          this.trace?.record("memory_recall", {
+            status: "started",
+            query: summarizeText(userMessage),
+          });
+        }
       }
     }
 
@@ -1009,6 +1180,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         memoryPrefetch.consumed = true;
         try {
           const memories = await memoryPrefetch.promise;
+          this.trace?.record("memory_recall", {
+            status: memories.length > 0 ? "hit" : "miss",
+            count: memories.length,
+            paths: memories.map((m) => m.path),
+          });
           if (memories.length > 0) {
             const injectionText = formatMemoriesForInjection(memories);
             const last = this.anthropicMessages[this.anthropicMessages.length - 1];
@@ -1027,7 +1203,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
               this.sessionMemoryBytes += Buffer.byteLength(m.content);
             }
           }
-        } catch { /* prefetch errors already logged */ }
+        } catch (err) {
+          this.trace?.error("memory_recall", err);
+          /* prefetch errors already logged */
+        }
       }
 
       if (!this.isSubAgent) startSpinner();
@@ -1038,15 +1217,28 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
       // immediately — the tool runs while the model still generates.
       const earlyExecutions = new Map<string, Promise<string>>();
 
-      const response = await this.callAnthropicStream((block) => {
-        const input = block.input as Record<string, any>;
-        if (CONCURRENCY_SAFE_TOOLS.has(block.name)) {
-          const perm = checkPermission(block.name, input, this.permissionMode, this.planFilePath || undefined);
-          if (perm.action === "allow") {
-            earlyExecutions.set(block.id, this.executeToolCall(block.name, input));
-          }
-        }
+      const modelStarted = Date.now();
+      this.trace?.record("model_call_start", {
+        backend: "anthropic",
+        model: this.model,
+        messageCount: this.anthropicMessages.length,
+        toolCount: getActiveToolDefinitions(this.tools).length,
       });
+      let response: Anthropic.Message;
+      try {
+        response = await this.callAnthropicStream((block) => {
+          const input = block.input as Record<string, any>;
+          if (CONCURRENCY_SAFE_TOOLS.has(block.name)) {
+            const perm = this.checkToolPermission(block.name, input);
+            if (perm.action === "allow") {
+              earlyExecutions.set(block.id, this.executeToolCall(block.name, input, perm));
+            }
+          }
+        });
+      } catch (err) {
+        this.trace?.error("model_call", err, { backend: "anthropic", model: this.model });
+        throw err;
+      }
       if (!this.isSubAgent) stopSpinner();
       this.lastApiCallTime = Date.now();
       this.totalInputTokens += response.usage.input_tokens;
@@ -1060,6 +1252,21 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
           toolUses.push(block);
         }
       }
+
+      this.trace?.record("model_call_end", {
+        backend: "anthropic",
+        model: this.model,
+        durationMs: Date.now() - modelStarted,
+        inputTokens: response.usage.input_tokens,
+        outputTokens: response.usage.output_tokens,
+        stopReason: response.stop_reason,
+        toolUseCount: toolUses.length,
+      });
+      this.trace?.record("cost_update", {
+        inputTokens: this.totalInputTokens,
+        outputTokens: this.totalOutputTokens,
+        estimatedCostUsd: this.getCurrentCostUsd(),
+      });
 
       this.anthropicMessages.push({
         role: "assistant",
@@ -1102,7 +1309,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         }
 
         // Permission check for tools not started early
-        const perm = checkPermission(toolUse.name, input, this.permissionMode, this.planFilePath || undefined);
+        const perm = this.checkToolPermission(toolUse.name, input);
         if (perm.action === "deny") {
           printInfo(`Denied: ${perm.message}`);
           toolResults.push({ type: "tool_result", tool_use_id: toolUse.id, content: `Action denied: ${perm.message}` });
@@ -1117,7 +1324,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
           this.confirmedPaths.add(perm.message);
         }
 
-        const raw = await this.executeToolCall(toolUse.name, input);
+        const raw = await this.executeToolCall(toolUse.name, input, perm);
         const res = this.persistLargeResult(toolUse.name, raw);
         printToolResult(toolUse.name, res);
 
@@ -1246,6 +1453,12 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
           userMessage, sq,
           this.alreadySurfacedMemories, this.sessionMemoryBytes,
         );
+        if (memoryPrefetch) {
+          this.trace?.record("memory_recall", {
+            status: "started",
+            query: summarizeText(userMessage),
+          });
+        }
       }
     }
 
@@ -1260,6 +1473,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         memoryPrefetch.consumed = true;
         try {
           const memories = await memoryPrefetch.promise;
+          this.trace?.record("memory_recall", {
+            status: memories.length > 0 ? "hit" : "miss",
+            count: memories.length,
+            paths: memories.map((m) => m.path),
+          });
           if (memories.length > 0) {
             const injectionText = formatMemoriesForInjection(memories);
             const last = this.openaiMessages[this.openaiMessages.length - 1];
@@ -1273,11 +1491,27 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
               this.sessionMemoryBytes += Buffer.byteLength(m.content);
             }
           }
-        } catch { /* prefetch errors already logged */ }
+        } catch (err) {
+          this.trace?.error("memory_recall", err);
+          /* prefetch errors already logged */
+        }
       }
 
       if (!this.isSubAgent) startSpinner();
-      const response = await this.callOpenAIStream();
+      const modelStarted = Date.now();
+      this.trace?.record("model_call_start", {
+        backend: "openai-compatible",
+        model: this.model,
+        messageCount: this.openaiMessages.length,
+        toolCount: getActiveToolDefinitions(this.tools).length,
+      });
+      let response: OpenAI.ChatCompletion;
+      try {
+        response = await this.callOpenAIStream();
+      } catch (err) {
+        this.trace?.error("model_call", err, { backend: "openai-compatible", model: this.model });
+        throw err;
+      }
       if (!this.isSubAgent) stopSpinner();
       this.lastApiCallTime = Date.now();
 
@@ -1289,14 +1523,39 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
       }
 
       const choice = response.choices?.[0];
-      if (!choice) break;
+      if (!choice) {
+        this.trace?.record("model_call_end", {
+          backend: "openai-compatible",
+          model: this.model,
+          durationMs: Date.now() - modelStarted,
+          inputTokens: response.usage?.prompt_tokens || 0,
+          outputTokens: response.usage?.completion_tokens || 0,
+          stopReason: "no_choice",
+          toolUseCount: 0,
+        });
+        break;
+      }
       const message = choice.message;
+      const toolCalls = message.tool_calls;
+      this.trace?.record("model_call_end", {
+        backend: "openai-compatible",
+        model: this.model,
+        durationMs: Date.now() - modelStarted,
+        inputTokens: response.usage?.prompt_tokens || 0,
+        outputTokens: response.usage?.completion_tokens || 0,
+        stopReason: choice.finish_reason,
+        toolUseCount: toolCalls?.length || 0,
+      });
+      this.trace?.record("cost_update", {
+        inputTokens: this.totalInputTokens,
+        outputTokens: this.totalOutputTokens,
+        estimatedCostUsd: this.getCurrentCostUsd(),
+      });
 
       // Add assistant message to history
       this.openaiMessages.push(message);
 
       // If no tool calls, we're done
-      const toolCalls = message.tool_calls;
       if (!toolCalls || toolCalls.length === 0) {
         if (!this.isSubAgent) {
           printCost(this.totalInputTokens, this.totalOutputTokens);
@@ -1313,7 +1572,14 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
       }
 
       // Phase 1: Parse & permission-check all tool calls (serial — user interaction)
-      type OAIChecked = { tc: typeof toolCalls[0]; fnName: string; input: Record<string, any>; allowed: boolean; result?: string };
+      type OAIChecked = {
+        tc: typeof toolCalls[0];
+        fnName: string;
+        input: Record<string, any>;
+        allowed: boolean;
+        permission: { action: "allow" | "deny" | "confirm"; message?: string };
+        result?: string;
+      };
       const oaiChecked: OAIChecked[] = [];
       for (const tc of toolCalls) {
         if (this.abortController?.signal.aborted) break;
@@ -1324,21 +1590,21 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
         printToolCall(fnName, input);
 
-        const perm = checkPermission(fnName, input, this.permissionMode, this.planFilePath || undefined);
+        const perm = this.checkToolPermission(fnName, input);
         if (perm.action === "deny") {
           printInfo(`Denied: ${perm.message}`);
-          oaiChecked.push({ tc, fnName, input, allowed: false, result: `Action denied: ${perm.message}` });
+          oaiChecked.push({ tc, fnName, input, allowed: false, permission: perm, result: `Action denied: ${perm.message}` });
           continue;
         }
         if (perm.action === "confirm" && perm.message && !this.confirmedPaths.has(perm.message)) {
           const confirmed = await this.confirmDangerous(perm.message);
           if (!confirmed) {
-            oaiChecked.push({ tc, fnName, input, allowed: false, result: "User denied this action." });
+            oaiChecked.push({ tc, fnName, input, allowed: false, permission: perm, result: "User denied this action." });
             continue;
           }
           this.confirmedPaths.add(perm.message);
         }
-        oaiChecked.push({ tc, fnName, input, allowed: true });
+        oaiChecked.push({ tc, fnName, input, allowed: true, permission: perm });
       }
 
       // Phase 2: Group & execute (parallel for consecutive safe tools)
@@ -1360,7 +1626,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         if (batch.concurrent) {
           const results = await Promise.all(
             batch.items.map(async (ct) => {
-              const raw = await this.executeToolCall(ct.fnName, ct.input);
+              const raw = await this.executeToolCall(ct.fnName, ct.input, ct.permission);
               const res = this.persistLargeResult(ct.fnName, raw);
               printToolResult(ct.fnName, res);
               return { ct, res };
@@ -1375,7 +1641,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
               this.openaiMessages.push({ role: "tool", tool_call_id: ct.tc.id, content: ct.result! });
               continue;
             }
-            const raw = await this.executeToolCall(ct.fnName, ct.input);
+            const raw = await this.executeToolCall(ct.fnName, ct.input, ct.permission);
             const res = this.persistLargeResult(ct.fnName, raw);
             printToolResult(ct.fnName, res);
 

@@ -3,4 +3,5 @@ dist/
 .env
 __pycache__/
 my-docs/
+.mini-claude/
 .npm-cache/

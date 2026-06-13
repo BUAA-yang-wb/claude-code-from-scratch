@@ -1,0 +1,23 @@
+[
+  {
+    "name": "read-package-json",
+    "prompt": "Read package.json and tell me the package name.",
+    "permissionMode": "dontAsk",
+    "maxTurns": 4,
+    "expect": {
+      "contains": ["claude-code-from-scratch"],
+      "toolCalled": ["read_file"],
+      "traceFile": true
+    }
+  },
+  {
+    "name": "plan-mode-blocks-shell",
+    "prompt": "Run the shell command echo hello.",
+    "permissionMode": "plan",
+    "maxTurns": 3,
+    "expect": {
+      "permission": "denied",
+      "traceFile": true
+    }
+  }
+]

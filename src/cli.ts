@@ -7,6 +7,7 @@ import { loadSession, getLatestSessionId } from "./session.js";
 import { listMemories } from "./memory.js";
 import { discoverSkills, resolveSkillPrompt, getSkillByName, executeSkill } from "./skills.js";
 import type { PermissionMode } from "./tools.js";
+import { TraceRecorder } from "./trace.js";
 
 interface ParsedArgs {
   permissionMode: PermissionMode;
@@ -17,6 +18,8 @@ interface ParsedArgs {
   thinking?: boolean;
   maxCost?: number;
   maxTurns?: number;
+  trace?: boolean;
+  traceFile?: string;
 }
 
 const DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-pro";
@@ -32,6 +35,8 @@ function parseArgs(): ParsedArgs {
   let resume = false;
   let maxCost: number | undefined;
   let maxTurns: number | undefined;
+  let trace = false;
+  let traceFile: string | undefined;
   const positional: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
@@ -57,6 +62,11 @@ function parseArgs(): ParsedArgs {
     } else if (args[i] === "--max-turns") {
       const v = parseInt(args[++i], 10);
       if (!isNaN(v)) maxTurns = v;
+    } else if (args[i] === "--trace") {
+      trace = true;
+    } else if (args[i] === "--trace-file") {
+      trace = true;
+      traceFile = args[++i];
     } else if (args[i] === "--help" || args[i] === "-h") {
       console.log(`
 Usage: mini-claude [options] [prompt]
@@ -73,6 +83,8 @@ Options:
   --resume            Resume the last session
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
+  --trace             Write AgentOps JSONL trace to .mini-claude/traces/
+  --trace-file PATH   Write AgentOps JSONL trace to a specific file
   --help, -h          Show this help
 
 REPL commands:
@@ -109,6 +121,8 @@ Examples:
     thinking,
     maxCost,
     maxTurns,
+    trace,
+    traceFile,
     prompt: positional.length > 0 ? positional.join(" ") : undefined,
   };
 }
@@ -298,7 +312,7 @@ async function runRepl(agent: Agent) {
 }
 
 async function main() {
-  const { permissionMode, model, apiBase, prompt, resume, thinking, maxCost, maxTurns } = parseArgs();
+  const { permissionMode, model, apiBase, prompt, resume, thinking, maxCost, maxTurns, trace, traceFile } = parseArgs();
 
   // Resolve API config from env vars (API keys only via env, not CLI)
   let resolvedApiBase = apiBase;
@@ -342,11 +356,17 @@ async function main() {
     process.exit(1);
   }
 
+  const traceRecorder = trace ? new TraceRecorder({ filePath: traceFile }) : undefined;
+  if (traceRecorder) {
+    printInfo(`Trace enabled: ${traceRecorder.filePath}`);
+  }
+
   const agent = new Agent({
     permissionMode, model, thinking, maxCostUsd: maxCost, maxTurns,
     apiBase: resolvedUseOpenAI ? resolvedApiBase : undefined,
     anthropicBaseURL: !resolvedUseOpenAI ? resolvedApiBase : undefined,
     apiKey: resolvedApiKey,
+    trace: traceRecorder,
   });
 
   // Resume session if requested
